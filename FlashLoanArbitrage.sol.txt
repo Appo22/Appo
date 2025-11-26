@@ -1,0 +1,297 @@
+
+// SPDX-License-Identifier: MIT
+pragma solidity 0.8.10;
+
+// Aave v3 flash loan base receiver
+import "@aave/core-v3/contracts/flashloan/base/FlashLoanSimpleReceiverBase.sol";
+import "@aave/core-v3/contracts/interfaces/IPoolAddressesProvider.sol";
+import "@aave/core-v3/contracts/dependencies/openzeppelin/contracts/IERC20.sol";
+
+
+// Minimal Uniswap V2 router interface (supports swapExactTokensForTokens)
+interface IUniswapV2Router02 {
+    function swapExactTokensForTokens(
+        uint amountIn,
+        uint amountOutMin,
+        address[] calldata path,
+        address to,
+        uint deadline
+    ) external returns (uint[] memory amounts);
+
+    function factory() external pure returns (address);
+}
+
+contract AaveV3FlashLoan is FlashLoanSimpleReceiverBase {
+    address public owner;
+    IUniswapV2Router02 public immutable router;
+
+    event FlashLoanRequested(address indexed asset, uint256 amount);
+    event SwapExecuted(address indexed fromToken, address indexed toToken, uint256 amountIn, uint256 amountOut);
+    event ProfitWithdrawn(address indexed to, address token, uint256 amount);
+
+    modifier onlyOwner() {
+        require(msg.sender == owner, "Only owner");
+        _;
+    }
+
+    constructor(address _provider, address _router) FlashLoanSimpleReceiverBase(IPoolAddressesProvider(_provider)) {
+        owner = msg.sender;
+        router = IUniswapV2Router02(_router);
+    }
+
+    /**
+     * 1) Function that requests the flash loan from Aave v3 Pool
+     * - asset: token to borrow
+     * - amount: amount to borrow
+     * - params: extra encoded data passed to executeOperation (e.g. swap path, minOut)
+     */
+    function requestFlashLoan(address asset, uint256 amount, bytes calldata params) external onlyOwner {
+        emit FlashLoanRequested(asset, amount);
+        // referralCode set to 0
+        POOL.flashLoanSimple(address(this), asset, amount, params, 0);
+    }
+
+    /**
+     * 2) Callback executed by Aave after sending funds
+     * Signature required by Aave v3 FlashLoanSimpleReceiverBase
+     * - asset: borrowed asset
+     * - amount: borrowed amount
+     * - premium: fee to be paid on top of amount
+     * - initiator: who initiated the flash loan (should be this contract)
+     * - params: arbitrary bytes passed from requestFlashLoan
+     */
+    function executeOperation(
+        address asset,
+        uint256 amount,
+        uint256 premium,
+        address initiator,
+        bytes calldata params
+    ) external override returns (bool) {
+        require(msg.sender == address(POOL), "Caller must be pool");
+        require(initiator == address(this), "Initiator must be this contract");
+
+        // Decode params expected format:
+        // abi.encode(address[] path, uint256 amountOutMin)
+        (address[] memory path, uint256 amountOutMin) = abi.decode(params, (address[], uint256));
+
+        // Example logic: swap borrowed asset -> path[last]
+        // Approve router to pull 'asset'
+        IERC20(asset).approve(address(router), amount);
+
+        uint256 beforeBalance = IERC20(path[path.length - 1]).balanceOf(address(this));
+
+        // Perform the swap on UniswapV2-compatible router
+        uint[] memory amounts = router.swapExactTokensForTokens(
+            amount,
+            amountOutMin,
+            path,
+            address(this),
+            block.timestamp
+        );
+
+        uint256 afterBalance = IERC20(path[path.length - 1]).balanceOf(address(this));
+        uint256 amountOut = 0;
+        if (afterBalance > beforeBalance) {
+            amountOut = afterBalance - beforeBalance;
+        } else if (amounts.length > 0) {
+            amountOut = amounts[amounts.length - 1];
+        }
+
+        emit SwapExecuted(asset, path[path.length - 1], amount, amountOut);
+
+        // Repay loan + premium
+        uint256 totalDebt = amount + premium;
+
+        // We need to have `asset` balance to repay. If we swapped asset to another token, we must swap back or ensure path[last] == asset.
+        // For safety, this example assumes you swapped `asset` -> `asset` (i.e., path[0] == path[last]) OR your logic converts back to `asset` before repay.
+
+        // If the swap changed token type, add your additional logic here to convert proceeds back to `asset`.
+
+        // Approve pool to pull the owed amount
+        IERC20(asset).approve(address(POOL), totalDebt);
+
+        return true;
+    }
+
+    /* ---------- Owner helpers ---------- */
+
+    // Withdraw ERC20 profits to owner
+    function withdrawToken(address token) external onlyOwner {
+        uint256 bal = IERC20(token).balanceOf(address(this));
+        require(bal > 0, "No balance");
+        IERC20(token).transfer(owner, bal);
+        emit ProfitWithdrawn(owner, token, bal);
+    }
+
+    // Update owner
+    function setOwner(address newOwner) external onlyOwner {
+        require(newOwner != address(0), "Zero address");
+        owner = newOwner;
+    }
+
+    // Receive fallback
+    receive() external payable {}
+}
+
+/*
+Notes and guidance (read before deploying):
+- This contract uses Aave v3's FlashLoanSimpleReceiverBase; you must provide the correct PoolAddressesProvider address for the network you deploy to.
+- _router should be a UniswapV2-compatible router (Uniswap v2 / SushiSwap / PancakeSwap) on the target network.
+- The `params` argument to requestFlashLoan must be ABI-encoded as: abi.encode(address[] path, uint256 amountOutMin)
+  For example in JavaScript/ethers: ethers.utils.defaultAbiCoder.encode(["address[]","uint256"], [[tokenBorrowed, tokenTarget], minOut])
+- The example executeOperation performs a single swap (swapExactTokensForTokens). If you plan arbitrage, liquidation or multi-step paths, implement that logic inside executeOperation.
+- IMPORTANT: This example assumes you keep an `asset` balance to approve repayment. If executeOperation swaps away the borrowed `asset`, add logic to convert proceeds back to `asset` before approving the pool.
+- Always test on a testnet (Goerli, Sepolia, or network's testnet) before mainnet deployment. Flash loans are atomic and will revert if the pool is not repaid in the same transaction.
+
+Security checklist:
+- Verify all external addresses (PoolAddressesProvider, router) are correct for target network.
+- Use safe approval patterns (e.g., set to 0 then set to amount) if needed to avoid issues with some ERC20 implementations.
+- Add reentrancy guards if you expand functionality.
+- Add slippage guards (amountOutMin) when swapping.
+*/
+
+
+
+
+
+
+     Parameters:
+     provider: Aave PoolAddressesProvider address ( mainnet: 0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e )
+     Router: Uniswap V2 Router address ( mainnet: 0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D )
+     TokenOut: Token to swap into ( USDC: 0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48 )
+
+new AaveV3FlashSwap
+    0x2f39d218133AFaB8F2B819B1066c7E434Ad94E9e
+    0x7a250d5630B4cF539739dF2C5dAcb4c659F2488D
+    0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48
+
+
+  Call requestFlashLoan(asset, amount)
+  asset: token to borrow (DAI: 0x6B175474E89094C44Da98b954EedeAC495271d0F)
+  amount: amount in wei 1000000000000000000000
+
+  RequestFlashLoan
+    0x6B175474E89094C44Da98b954EedeAC495271d0F,  1000000000000000000000
+
+
+  // After the flash loan completes, withdraw any remaining tokens
+withdrawToken(0xA0b86991c6218b36c1d19D4a2e9Eb0cE3606eB48,1000000000000000000000
+	
+	
+	
+	In executeOperation(), after the swap:
+uint256 usdc_balance = IERC20(tokenOut).balanceOf(address(this));
+
+
+
+    If USDC > repay amount, you have profit
+if (usdc_balance > amountOwing) 
+    Profit exists, can withdraw later
+
+
+executeOperation
+asset: 0x6B175474E89094C44Da98b954EedeAC495271d0F ( DAI )
+amount: 1000000000000000000000 (With 18 Decimals)
+premium: 1005000000000000000000 ( This means with the interest)
+initiator: 0x9fa02fe6af1f2d2bef64462fe120dfa81baec0d5
+params: ( "0x" )
+
+
+┌─────────────────────────────────────────────────────────────┐
+│ 1. You call: requestFlashLoan(DAI, 1000e18)                 │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 2. Aave Pool sends 1000 DAI to your contract                │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 3. Aave Pool calls executeOperation() with:                 │
+│    - asset: DAI address                                     │
+│    - amount: 1000e18                                        │
+│    - premium: 5e15 (0.05% fee)                              │
+│    - initiator: your address                                │
+│    - params: custom data (if any)                           │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 4. Your contract executes logic:                            │
+│    - Swap DAI → USDC                                        │
+│    - Do arbitrage/liquidation                               │
+│    - Approve Pool to pull 1000 DAI + 5e15 premium           │
+└─────────────────────────────────────────────────────────────┘
+                            ↓
+┌─────────────────────────────────────────────────────────────┐
+│ 5. executeOperation() returns TRUE                          │
+│    → Aave Pool pulls repayment (amount + premium)           │
+│    → Transaction completes                                  │
+└─────────────────────────────────────────────────────────────┘
+
+function executeOperation(
+    address asset,           // DAI (what we borrowed)
+    uint256 amount,          // 1000e18 (how much we borrowed)
+    uint256 premium,         // 5e15 (fee to repay)
+    address initiator,       // msg.sender from requestFlashLoan
+    bytes calldata params    // custom data (unused here)
+) external override returns (bool) {
+
+
+
+    // ✅ SAFETY CHECK: Ensure only Aave Pool can call this
+    require(
+        msg.sender == address(IPool(IPoolAddressesProvider(address(ADDRESSES_PROVIDER)).getPool())),
+        "caller must be Pool"
+    );
+
+    // ✅ STEP 1: Prepare swap inputs
+    address tokenIn = asset;              // DAI
+    uint256 amountIn = amount;            // 1000e18
+
+    // ✅ STEP 2: Approve Uniswap router to spend our DAI
+    IERC20(tokenIn).approve(address(router), amountIn);
+
+    // ✅ STEP 3: Define swap path (DAI → USDC)
+    address[] memory path = new address[](2);
+    path[0] = tokenIn;                    // DAI
+    path[1] = tokenOut;                   // USDC
+
+    // ✅ STEP 4: Execute swap on Uniswap
+    router.swapExactTokensForTokens(
+        amountIn,                         // 1000 DAI
+        1,                                // ⚠️ DANGEROUS: accept ANY amount (fix this!)
+        path,
+        address(this),                    // send USDC back to us
+        block.timestamp + 300             // deadline
+    );
+
+    // ✅ STEP 5: Calculate total repayment
+    uint256 amountOwing = amount + premium;  // 1000 DAI + 5e15 fee
+
+    // ✅ STEP 6: Approve Aave Pool to pull repayment
+    IERC20(tokenIn).approve(
+        address(IPool(IPoolAddressesProvider(address(ADDRESSES_PROVIDER)).getPool())),
+        amountOwing
+    );
+
+    // ✅ STEP 7: Return TRUE to signal success
+    return true;
+}
+
+// CURRENT (UNSAFE):
+router.swapExactTokensForTokens(
+    amountIn,
+    1,  // ⚠️ Accept ANY output, even 1 wei!
+    path,
+    address(this),
+    block.timestamp + 300
+);
+
+// FIXED:
+uint256 minAmountOut = (amountIn * 99) / 100;  // Allow 1% slippage
+router.swapExactTokensForTokens(
+    amountIn,
+    minAmountOut,  // ✅ Protect against sandwich attacks
+    path,
+    address(this),
+    block.timestamp + 300
+);
